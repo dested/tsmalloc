@@ -3,10 +3,18 @@ export function objectSafeKeys<T>(obj: T): (keyof T)[] {
 }
 
 export function assert(assertion: boolean): asserts assertion {
-  if (!assertion) throw new Error('bad');
+  if (!assertion) {
+    debugger;
+
+    throw new Error('bad');
+  }
 }
 export function assertEQ<T>(left: T, right: T): true {
-  if (left !== right) throw new Error(`bad ${left} ${right}`);
+  if (left !== right) {
+    debugger;
+
+    throw new Error(`bad ${left} ${right}`);
+  }
   return true;
 }
 

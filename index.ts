@@ -33,6 +33,47 @@ export class TSMalloc {
     for (let i = 0; i < this.freeList.length; i++) {
       const sizePointer = this.freeList[i];
 
+      const freeSize = memoryView.getUint32(sizePointer);
+
+      // Got the block of the needed freeSize:
+      if (freeSize >= schemaSize) {
+        //clear
+        this.memory.uint.fill(0, sizePointer, sizePointer + schemaSize);
+
+        memoryView.setUint32(sizePointer, schemaSize);
+        this.freeList.splice(i, 1);
+
+        // Payload data pointer.
+        const dataPointer = sizePointer + OBJECT_HEADER_ELEM_SIZE;
+
+        // Next free block if still can bump the pointer:
+        const nextFree = sizePointer + schemaSize;
+        if (nextFree <= memoryView.byteLength - 1) {
+          if (freeSize - schemaSize > 0) {
+            memoryView.setUint32(nextFree, freeSize - schemaSize);
+            this.freeList.push(nextFree);
+            this.freeList.sort();
+          }
+        }
+        let mallocPointer = new MallocObjectPointer(schema, this, dataPointer);
+        if (values) {
+          for (const key of objectSafeKeys(values)) {
+            const v = values[key];
+            mallocPointer.set(key, v as SchemaValue<T[typeof key]>);
+          }
+        }
+        return mallocPointer;
+      }
+    }
+    throw new Error('out of memory');
+  }
+  mallocString(value: string) {
+    let memoryView = this.memory.view;
+    const schemaSize = value.length * 2 + OBJECT_HEADER_ELEM_SIZE;
+
+    for (let i = 0; i < this.freeList.length; i++) {
+      const sizePointer = this.freeList[i];
+
       const size = memoryView.getUint32(sizePointer);
 
       // Got the block of the needed size:
@@ -53,25 +94,43 @@ export class TSMalloc {
           }
         }
 
-        let mallocPointer = new MallocObjectPointer(schema, this, dataPointer);
-        if (values) {
-          for (const key of objectSafeKeys(values)) {
-            const v = values[key];
-            mallocPointer.set(key, v as SchemaValue<T[typeof key]>);
-          }
+        for (let i = 0, strLen = value.length; i < strLen; i++) {
+          this.memory.view.setUint16(dataPointer + i * 2, value.charCodeAt(i));
         }
-        return mallocPointer;
+
+        return sizePointer;
       }
     }
     throw new Error('out of memory');
   }
   freeObject(pointer: MallocObjectPointer<any>) {
     for (const item of pointer._schema.layout.items) {
+      switch (item[1].type) {
+        case 'float32':
+          break;
+        case 'uint8':
+          break;
+        case 'uint16':
+          break;
+        case 'stringPointer':
+          this.freeOffset(pointer.getOffset(item[0]));
+          break;
+        case 'objectPointer':
+          (pointer.get(item[0]) as MallocObjectPointer<any>).free();
+          break;
+      }
       if (item[1].type === 'objectPointer') {
-        (pointer.get(item[0])! as MallocObjectPointer<any>).free();
       }
     }
-    this.freeList.push(pointer.offset - OBJECT_HEADER_ELEM_SIZE);
+    this.freeOffset(pointer.offset);
+  }
+
+  freeString(offset: number) {
+    this.freeOffset(offset);
+  }
+
+  freeOffset(offset: number) {
+    this.freeList.push(offset - OBJECT_HEADER_ELEM_SIZE);
     this.freeList.sort();
     for (let i = 0; i < this.freeList.length - 1; i++) {
       const pointer = this.freeList[i];
@@ -89,7 +148,7 @@ export class TSMalloc {
 
 type SchemaValue<T> = T extends 'float32' | 'uint8' | 'uint16'
   ? number
-  : T extends string
+  : T extends 'string'
   ? string
   : T extends {}
   ? T extends {type: 'array'; layout: Layout; value: infer J}
@@ -104,19 +163,36 @@ export class MallocObjectPointer<TObject> {
 
   set<K extends keyof TObject>(c: K, value: SchemaValue<TObject[K]>) {
     let schema = this._schema.layout.items.get(c as string)!;
+    let offset = schema.offset + this.offset;
+
     switch (schema.type) {
       case 'float32':
-        this.malloc.memory.view.setFloat32(schema.offset + this.offset, value as number);
+        this.malloc.memory.view.setFloat32(offset, value as number);
         break;
       case 'uint16':
-        this.malloc.memory.view.setUint16(schema.offset + this.offset, value as number);
+        this.malloc.memory.view.setUint16(offset, value as number);
         break;
       case 'objectPointer':
+        let objectOffset = this.malloc.memory.view.getUint32(offset);
+        if (objectOffset !== 0) {
+          //this idk should be like an undefined header
+          this.malloc.freeOffset(objectOffset);
+        }
         const v = value as MallocObjectPointer<any>;
-        this.malloc.memory.view.setUint32(schema.offset + this.offset, v.offset);
+        this.malloc.memory.view.setUint32(offset, v.offset);
+        break;
+      case 'stringPointer':
+        let stringOffset = this.malloc.memory.view.getUint32(offset);
+        if (stringOffset !== 0) {
+          //this idk should be like an undefined header
+          this.malloc.freeString(stringOffset);
+        }
+
+        const stringPointer = this.malloc.mallocString(value as string);
+        this.malloc.memory.view.setUint32(offset, stringPointer);
         break;
       case 'uint8':
-        this.malloc.memory.view.setUint8(schema.offset + this.offset, value as number);
+        this.malloc.memory.view.setUint8(offset, value as number);
         break;
       default:
         throw unreachable(schema);
@@ -132,11 +208,25 @@ export class MallocObjectPointer<TObject> {
       case 'objectPointer':
         let pointer = this.malloc.memory.view.getUint32(schema.offset + this.offset);
         return new MallocObjectPointer(schema.schema, this.malloc, pointer) as SchemaValue<TObject[C]>;
+      case 'stringPointer':
+        let stringPointer = this.malloc.memory.view.getUint32(schema.offset + this.offset);
+        const stringSize = (this.malloc.memory.view.getUint32(stringPointer) - OBJECT_HEADER_ELEM_SIZE) / 2;
+        const strs: string[] = [];
+        for (let i = 0, strLen = stringSize; i < strLen; i++) {
+          strs.push(
+            String.fromCharCode(this.malloc.memory.view.getUint16(stringPointer + OBJECT_HEADER_ELEM_SIZE + i * 2))
+          );
+        }
+        return strs.join('') as SchemaValue<TObject[C]>;
       case 'uint8':
         return this.malloc.memory.view.getUint8(schema.offset + this.offset) as SchemaValue<TObject[C]>;
       default:
         throw unreachable(schema);
     }
+  }
+  getOffset<C extends keyof TObject>(c: C): number {
+    let schema = this._schema.layout.items.get(c as string)!;
+    return schema.offset + this.offset;
   }
   schema<C extends keyof TObject>(c: C): TObject[C] {
     return this._schema.value[c] as unknown as TObject[C];
@@ -158,10 +248,10 @@ export class MallocArrayPointer<T> {
 type SchemaTypeObjectOrArray<T> = SchemaTypeArray<T> | SchemaTypeObject<T>;
 
 type SchemaTypeKeyValue<T> = {
-  [key in keyof T]: 'float32' | 'uint8' | 'uint16' | SchemaTypeObjectOrArray<T[key]>;
+  [key in keyof T]: 'float32' | 'uint8' | 'uint16' | 'string' | SchemaTypeObjectOrArray<T[key]>;
 };
 export type LayoutItem =
-  | {offset: number; type: 'float32' | 'uint8' | 'uint16'}
+  | {offset: number; type: 'float32' | 'uint8' | 'uint16' | 'stringPointer'}
   | {offset: number; type: 'objectPointer'; schema: SchemaTypeObject<any>};
 
 export type Layout = {size: number; items: Map<string, LayoutItem>};
@@ -197,9 +287,14 @@ function getKeysLayout<T>(c: SchemaTypeKeyValue<T>) {
         case 'uint16':
           layout.items.set(key as string, {offset: layout.size, type: cElement});
           layout.size += 2;
+          break;
         case 'uint8':
           layout.items.set(key as string, {offset: layout.size, type: cElement});
           layout.size += 1;
+          break;
+        case 'string':
+          layout.items.set(key as string, {offset: layout.size, type: 'stringPointer'});
+          layout.size += 4;
           break;
         default:
           throw unreachable(cElement);
@@ -285,7 +380,7 @@ function testSimple() {
   userPointer5.free();
   assert(m.memory.view.getUint32(0) === m.memory.view.byteLength);
 }
-// test0();
+
 function testObject() {
   const UserSchema = ObjectM({
     a: 'float32',
@@ -303,7 +398,6 @@ function testObject() {
   assert(userPointer.get('a') === 2312378);
   assert(userPointer.get('b') === 7);
   let dPointerGet = userPointer.get('d');
-  debugger;
   assert(dPointerGet.offset === dPointer.offset);
   assertEQ(dPointerGet.get('e'), 12);
   assert(dPointerGet.get('g') === 11);
@@ -312,8 +406,40 @@ function testObject() {
   userPointer.free();
   assert(m.memory.view.getUint32(0) === m.memory.view.byteLength);
 }
+
+function testString() {
+  const UserSchema = ObjectM({
+    a: 'float32',
+    b: 'uint8',
+    d: ObjectM({
+      e: 'float32',
+      g: 'uint16',
+      f: 'string',
+    }),
+  });
+  const userPointer = m.malloc(UserSchema, {a: 2312378, b: 7});
+  const dPointer = m.malloc(userPointer.schema('d'), {e: 32, g: 11, f: 'hideo ho'});
+  dPointer.set('e', 12);
+  userPointer.set('d', dPointer);
+  assert(userPointer.get('a') === 2312378);
+  assert(userPointer.get('b') === 7);
+  let dPointerGet = userPointer.get('d');
+  assert(dPointerGet.offset === dPointer.offset);
+  assertEQ(dPointerGet.get('e'), 12);
+  assertEQ(dPointerGet.get('g'), 11);
+  dPointerGet.set('g', 15);
+  assert(dPointerGet.get('g') === 15);
+  assert(dPointerGet.get('f') === 'hideo ho');
+  debugger;
+  dPointerGet.set('f', 'shoes');
+  assertEQ(dPointerGet.get('f') , 'shoes');
+  userPointer.free();
+  assert(m.memory.view.getUint32(0) === m.memory.view.byteLength);
+}
+
 testSimple();
 testObject();
+testString();
 
 function test2() {
   const UserSchema2 = ObjectM({
