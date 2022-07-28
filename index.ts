@@ -1,5 +1,5 @@
 import {ArrayBufferBuilder} from './arrayBufferBuilder';
-import {assert, objectSafeKeys} from './utils';
+import {assert, assertEQ, objectSafeKeys} from './utils';
 import {Narrow, unreachable} from './typeUtils';
 
 const WORD_SIZE_BYTES = 4;
@@ -66,6 +66,11 @@ export class TSMalloc {
     throw new Error('out of memory');
   }
   freeObject(pointer: MallocObjectPointer<any>) {
+    for (const item of pointer._schema.layout.items) {
+      if (item[1].type === 'objectPointer') {
+        (pointer.get(item[0])! as MallocObjectPointer<any>).free();
+      }
+    }
     this.freeList.push(pointer.offset - OBJECT_HEADER_ELEM_SIZE);
     this.freeList.sort();
     for (let i = 0; i < this.freeList.length - 1; i++) {
@@ -74,7 +79,6 @@ export class TSMalloc {
       const size = this.memory.view.getUint32(pointer);
       if (pointer + size === nextPointer) {
         const nextSize = this.memory.view.getUint32(nextPointer);
-        debugger;
         this.memory.view.setUint32(pointer, size + nextSize);
         this.freeList.splice(i + 1, 1);
         i--;
@@ -83,19 +87,15 @@ export class TSMalloc {
   }
 }
 
-type SchemaValue<T> = T extends 'float32' | 'uint8'
+type SchemaValue<T> = T extends 'float32' | 'uint8' | 'uint16'
   ? number
   : T extends string
   ? string
   : T extends {}
   ? T extends {type: 'array'; layout: Layout; value: infer J}
-    ? J extends Schema
-      ? MallocArrayPointer<J>
-      : never
+    ? MallocArrayPointer<J>
     : T extends {type: 'object'; layout: Layout; value: infer J}
-    ? J extends Schema
-      ? MallocObjectPointer<J>
-      : never
+    ? MallocObjectPointer<J>
     : never
   : never;
 
@@ -111,11 +111,15 @@ export class MallocObjectPointer<TObject> {
       case 'uint16':
         this.malloc.memory.view.setUint16(schema.offset + this.offset, value as number);
         break;
+      case 'objectPointer':
+        const v = value as MallocObjectPointer<any>;
+        this.malloc.memory.view.setUint32(schema.offset + this.offset, v.offset);
+        break;
       case 'uint8':
         this.malloc.memory.view.setUint8(schema.offset + this.offset, value as number);
         break;
       default:
-        throw unreachable(schema.type);
+        throw unreachable(schema);
     }
   }
   get<C extends keyof TObject>(c: C): SchemaValue<TObject[C]> {
@@ -125,10 +129,13 @@ export class MallocObjectPointer<TObject> {
         return this.malloc.memory.view.getFloat32(schema.offset + this.offset) as SchemaValue<TObject[C]>;
       case 'uint16':
         return this.malloc.memory.view.getUint16(schema.offset + this.offset) as SchemaValue<TObject[C]>;
+      case 'objectPointer':
+        let pointer = this.malloc.memory.view.getUint32(schema.offset + this.offset);
+        return new MallocObjectPointer(schema.schema, this.malloc, pointer) as SchemaValue<TObject[C]>;
       case 'uint8':
         return this.malloc.memory.view.getUint8(schema.offset + this.offset) as SchemaValue<TObject[C]>;
       default:
-        throw unreachable(schema.type);
+        throw unreachable(schema);
     }
   }
   schema<C extends keyof TObject>(c: C): TObject[C] {
@@ -148,19 +155,21 @@ export class MallocArrayPointer<T> {
   }
 }
 
-type SchemaTypeObjectOrArray<T extends Schema> = SchemaTypeArray<T> | SchemaTypeObject<T>;
+type SchemaTypeObjectOrArray<T> = SchemaTypeArray<T> | SchemaTypeObject<T>;
 
 type SchemaTypeKeyValue<T> = {
-  [key in keyof T]: 'float32' | 'uint8' | 'uint16' | SchemaTypeObjectOrArray<any>;
+  [key in keyof T]: 'float32' | 'uint8' | 'uint16' | SchemaTypeObjectOrArray<T[key]>;
 };
-type SchemaTypeKeys<T> = {
+export type LayoutItem =
+  | {offset: number; type: 'float32' | 'uint8' | 'uint16'}
+  | {offset: number; type: 'objectPointer'; schema: SchemaTypeObject<any>};
+
+export type Layout = {size: number; items: Map<string, LayoutItem>};
+export type Schema = SchemaTypeKeys<any> | SchemaTypeObjectOrArray<any>;
+export type SchemaTypeKeys<T> = {
   type: 'keys';
   keys: SchemaTypeKeyValue<T>;
 };
-export type LayoutItem = {offset: number; type: 'float32' | 'uint8' | 'uint16'};
-export type Layout = {size: number; items: Map<string, LayoutItem>};
-export type Schema = SchemaTypeKeys<any> | SchemaTypeObjectOrArray<any>;
-
 export type SchemaTypeArray<T> = {
   type: 'array';
   layout: Layout;
@@ -179,27 +188,41 @@ function getKeysLayout<T>(c: SchemaTypeKeyValue<T>) {
   };
   for (const key of objectSafeKeys(c)) {
     let cElement = c[key];
-    switch (cElement) {
-      case 'float32':
-        layout.items.set(key as string, {offset: layout.size, type: cElement});
-        layout.size += 4;
-        break;
-      case 'uint16':
-        layout.items.set(key as string, {offset: layout.size, type: cElement});
-        layout.size += 2;
-      case 'uint8':
-        layout.items.set(key as string, {offset: layout.size, type: cElement});
-        layout.size += 1;
-        break;
-      default:
-        throw unreachable(cElement);
+    if (typeof cElement === 'string') {
+      switch (cElement) {
+        case 'float32':
+          layout.items.set(key as string, {offset: layout.size, type: cElement});
+          layout.size += 4;
+          break;
+        case 'uint16':
+          layout.items.set(key as string, {offset: layout.size, type: cElement});
+          layout.size += 2;
+        case 'uint8':
+          layout.items.set(key as string, {offset: layout.size, type: cElement});
+          layout.size += 1;
+          break;
+        default:
+          throw unreachable(cElement);
+      }
+    } else {
+      switch (cElement.type) {
+        case 'object':
+          layout.items.set(key as string, {offset: layout.size, type: 'objectPointer', schema: cElement});
+          layout.size += 4;
+          break;
+        case 'array':
+          throw new Error('no array yet');
+          break;
+        default:
+          throw unreachable(cElement);
+      }
     }
   }
   layout.size = align(layout.size);
   return layout;
 }
 
-const ArrayM = function <T extends Schema>(c: Narrow<T>): SchemaTypeArray<T> {
+function ArrayM<T>(c: Narrow<T>): SchemaTypeArray<T> {
   return null!;
   /*
   return {
@@ -208,20 +231,20 @@ const ArrayM = function <T extends Schema>(c: Narrow<T>): SchemaTypeArray<T> {
     layout: getLayout(c as T),
   };
 */
-};
+}
 
-const ObjectM = function <T extends SchemaTypeKeyValue<any>>(c: T): SchemaTypeObject<T> {
+function ObjectM<T>(c: Narrow<T extends SchemaTypeKeyValue<infer J> ? T : never>): SchemaTypeObject<T> {
   return {
-    value: c,
+    value: c as T,
     type: 'object',
-    layout: getKeysLayout(c),
+    layout: getKeysLayout(c as T),
   };
-};
+}
 
 const memory = new ArrayBufferBuilder(1024 * 1024 * 3);
 const m = new TSMalloc(memory);
 
-function test0() {
+function testSimple() {
   const UserSchema = ObjectM({
     a: 'float32',
     b: 'uint8',
@@ -249,7 +272,6 @@ function test0() {
   assert(userPointer2.get('a') === 122);
   assert(userPointer2.get('b') === 221);
 
-  console.log('third');
   const userPointer3 = m.malloc(UserSchema, {a: 2312, b: 5});
   const userPointer4 = m.malloc(UserSchema, {a: 2313, b: 6});
   const userPointer5 = m.malloc(UserSchema, {a: 2314, b: 7});
@@ -258,33 +280,40 @@ function test0() {
   const userPointer6 = m.malloc(UserSchema, {a: 2315, b: 7});
   const userPointer7 = m.malloc(UserSchema, {a: 2316, b: 7});
   userPointer7.free();
-  debugger;
   userPointer2.free();
   userPointer6.free();
-  debugger;
   userPointer5.free();
+  assert(m.memory.view.getUint32(0) === m.memory.view.byteLength);
 }
-test0();
-function test1() {
+// test0();
+function testObject() {
   const UserSchema = ObjectM({
     a: 'float32',
     b: 'uint8',
     d: ObjectM({
       e: 'float32',
+      g: 'uint16',
       // f: 'string',
     }),
   });
   const userPointer = m.malloc(UserSchema, {a: 2312378, b: 7});
-  // userPointer.set('a', 12);
-  // userPointer.set('b', '12');
-  const dPointer = m.malloc(userPointer.schema('d'));
+  const dPointer = m.malloc(userPointer.schema('d'), {e: 32, g: 11});
   dPointer.set('e', 12);
-  // dPointer.set('f', '12');
-  // userPointer.set('d', dPointer);
-  console.log(userPointer.get('a'));
-  console.log(userPointer.get('b'));
-  console.log(userPointer.get('d'));
+  userPointer.set('d', dPointer);
+  assert(userPointer.get('a') === 2312378);
+  assert(userPointer.get('b') === 7);
+  let dPointerGet = userPointer.get('d');
+  debugger;
+  assert(dPointerGet.offset === dPointer.offset);
+  assertEQ(dPointerGet.get('e'), 12);
+  assert(dPointerGet.get('g') === 11);
+  dPointerGet.set('g', 15);
+  assert(dPointerGet.get('g') === 15);
+  userPointer.free();
+  assert(m.memory.view.getUint32(0) === m.memory.view.byteLength);
 }
+testSimple();
+testObject();
 
 function test2() {
   const UserSchema2 = ObjectM({
